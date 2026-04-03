@@ -50,18 +50,59 @@ static uint8_t last_lcd_byte = 0xFF;
 static bool    lcd_byte_valid = false;
 static bool    capture_next_lcd = false;
 
-// TX command state
-static uint8_t  tx_command_byte = 0xFF;
-static bool     tx_pending = false;
-static uint32_t tx_frame_decoded_us = 0;
+// TX command state — tx_command_byte is written by main loop, read by HRV task
+static volatile uint8_t  tx_command_byte = 0xFF;
+static volatile bool     tx_pending = false;
+static volatile uint32_t tx_frame_decoded_us = 0;
 
-#define TX_DELAY_US      860   // ~5.86ms from D7 start (matches real LCD command timing)
+// TX delay lookup — timing is part of the protocol, each command has a unique delay
+// Microseconds from frame decode (D7 fully received) to TX byte start
+// Pattern: ~500us (1 bit period) step per speed level
+uint16_t get_tx_delay_us(uint8_t cmd_byte) {
+    switch (cmd_byte) {
+        case 0xCF: case 0xDF: return  560;  // Fan 1: 5.86ms from D7 start
+        case 0xE7: case 0xEF: return 1060;  // Fan 2: 6.36ms from D7 start
+        case 0xF3: case 0xF7: return 1570;  // Fan 3: 6.87ms from D7 start
+        case 0xF9: case 0xFB: return 2070;  // Fan 4: 7.37ms from D7 start
+        case 0xFC: case 0xFD: return 2580;  // Fan 5: 7.88ms from D7 start
+        case 0xFF: default:   return 3590;  // Idle:  8.89ms from D7 start
+    }
+}
 
 // Button state (BOOT button on GPIO0)
 #define BUTTON_PIN       0
 #define DEBOUNCE_MS      300
 static uint32_t last_button_ms = 0;
 static bool     tx_active = false;
+
+// Test sequence state
+static bool     test_running = false;
+static uint8_t  test_step = 0;
+static uint32_t test_step_ms = 0;
+#define TEST_STEP_MS     10000
+
+// Test sequence: cycle through all mode/fan combos
+// {mode, fan, label}
+struct test_entry_t {
+    hrv_mode_t mode;
+    uint8_t    fan;
+    const char* label;
+};
+
+static const test_entry_t TEST_SEQUENCE[] = {
+    {MODE_FRESH,   1, "Fresh Fan 1"},
+    {MODE_FRESH,   2, "Fresh Fan 2"},
+    {MODE_FRESH,   3, "Fresh Fan 3"},
+    {MODE_FRESH,   4, "Fresh Fan 4"},
+    {MODE_FRESH,   5, "Fresh Fan 5"},
+    {MODE_RECIRC,  1, "Recirc Fan 1"},
+    {MODE_RECIRC,  2, "Recirc Fan 2"},
+    {MODE_RECIRC,  3, "Recirc Fan 3"},
+    {MODE_RECIRC,  4, "Recirc Fan 4"},
+    {MODE_RECIRC,  5, "Recirc Fan 5"},
+    {MODE_UNKNOWN, 0, "Idle (Off)"},
+};
+#define TEST_SEQUENCE_COUNT (sizeof(TEST_SEQUENCE) / sizeof(TEST_SEQUENCE[0]))
 
 // Display timing
 static uint32_t last_display_ms  = 0;
@@ -181,26 +222,33 @@ void hrv_process_byte(uint8_t val) {
     }
 }
 
-// ── UART polling ────────────────────────────────────────────────────────────
+// ── Button handling ─────────────────────────────────────────────────────────
 
-void hrv_uart_poll() {
-    uart_event_t event;
-    while (xQueueReceive(uart_queue, &event, 0) == pdTRUE) {
-        if (event.type == UART_BREAK) {
-            hrv_state.bath_timer = true;
-            bath_timer_start = millis();
-            Serial.println(">>> BATHROOM TIMER DETECTED <<<");
-        }
-    }
-
-    uint8_t rx_buf[32];
-    int len = uart_read_bytes(HRV_UART_NUM, rx_buf, sizeof(rx_buf), 0);
-    for (int i = 0; i < len; i++) {
-        hrv_process_byte(rx_buf[i]);
-    }
+void test_set_step(uint8_t step) {
+    const test_entry_t* e = &TEST_SEQUENCE[step];
+    tx_command_byte = hrv_lcd_command_byte(e->mode, e->fan);
+    tx_active = (e->mode != MODE_UNKNOWN);
+    Serial.printf("Test [%d/%d]: %s -> TX 0x%02X (delay %uus)\n",
+                  step + 1, TEST_SEQUENCE_COUNT, e->label,
+                  tx_command_byte, get_tx_delay_us(tx_command_byte));
 }
 
-// ── Button handling ─────────────────────────────────────────────────────────
+void test_poll() {
+    if (!test_running) return;
+    uint32_t now = millis();
+    if ((now - test_step_ms) >= TEST_STEP_MS) {
+        test_step++;
+        if (test_step >= TEST_SEQUENCE_COUNT) {
+            test_running = false;
+            tx_command_byte = 0xFF;
+            tx_active = false;
+            Serial.println(F("Test sequence complete"));
+        } else {
+            test_step_ms = now;
+            test_set_step(test_step);
+        }
+    }
+}
 
 void button_poll() {
     if (digitalRead(BUTTON_PIN) == LOW) {
@@ -226,22 +274,70 @@ void button_poll() {
                 }
             }
 
-            // Short press — toggle TX mode
+            // Short press — start/stop test sequence
             last_button_ms = millis();
-            tx_active = !tx_active;
-            tx_command_byte = tx_active ? 0xCF : 0xFF;
-            Serial.printf("Button: TX %s (0x%02X)\n",
-                          tx_active ? "Recirc Fan 1" : "Idle", tx_command_byte);
+            if (test_running) {
+                test_running = false;
+                tx_command_byte = 0xFF;
+                tx_active = false;
+                Serial.println(F("Test sequence stopped"));
+            } else {
+                test_running = true;
+                test_step = 0;
+                test_step_ms = millis();
+                test_set_step(0);
+            }
         }
     }
 }
 
-// ── TX polling ──────────────────────────────────────────────────────────────
+// ── HRV dedicated task (FreeRTOS, high priority, core 1) ────────────────────
+// Handles UART RX, frame decode, and precision TX timing.
+// Immune to OLED I2C, WiFi, MQTT blocking on the main loop.
 
-void hrv_tx_poll() {
-    if (tx_pending && (micros() - tx_frame_decoded_us >= TX_DELAY_US)) {
-        uart_write_bytes(HRV_UART_NUM, (const char*)&tx_command_byte, 1);
-        tx_pending = false;
+static SemaphoreHandle_t tx_semaphore = NULL;
+
+void hrv_tx_send() {
+    uint8_t cmd = tx_command_byte;  // snapshot volatile
+    uint16_t delay_us = get_tx_delay_us(cmd);
+
+    // Spin-wait for exact timing — this task runs at high priority,
+    // nothing except ISRs can preempt it
+    while ((micros() - tx_frame_decoded_us) < delay_us) { /* spin */ }
+
+    uart_write_bytes(HRV_UART_NUM, (const char*)&cmd, 1);
+    tx_pending = false;
+}
+
+void hrv_task(void* param) {
+    for (;;) {
+        // Check for UART break events (bathroom timer)
+        uart_event_t event;
+        while (xQueueReceive(uart_queue, &event, 0) == pdTRUE) {
+            if (event.type == UART_BREAK) {
+                hrv_state.bath_timer = true;
+                bath_timer_start = millis();
+            }
+        }
+
+        // Block until a byte arrives (yields CPU efficiently via semaphore).
+        // Returns immediately when data is available — near-zero latency.
+        uint8_t byte;
+        if (uart_read_bytes(HRV_UART_NUM, &byte, 1, pdMS_TO_TICKS(1)) == 1) {
+            hrv_process_byte(byte);
+
+            // Drain any remaining buffered bytes without waiting
+            uint8_t rx_buf[31];
+            int len = uart_read_bytes(HRV_UART_NUM, rx_buf, sizeof(rx_buf), 0);
+            for (int i = 0; i < len; i++) {
+                hrv_process_byte(rx_buf[i]);
+            }
+        }
+
+        // TX: spin-wait for precise timing then send
+        if (tx_pending) {
+            hrv_tx_send();
+        }
     }
 }
 
@@ -526,11 +622,13 @@ void display_update() {
                               ((now - bath_timer_start) < BATH_TIMER_DISPLAY_MS);
 
     static bool prev_tx_active = false;
+    static uint8_t prev_test_step = 0xFF;
     bool state_changed = (hrv_state.mode      != prev_display_state.mode) ||
                          (hrv_state.fan_speed  != prev_display_state.fan_speed) ||
                          (hrv_state.valid      != prev_display_state.valid) ||
                          (hrv_state.bath_timer != prev_display_state.bath_timer) ||
-                         (tx_active            != prev_tx_active);
+                         (tx_active            != prev_tx_active) ||
+                         (test_step            != prev_test_step);
     bool heartbeat = (now - last_display_ms) >= DISPLAY_HEARTBEAT_MS;
 
     if (!state_changed && !heartbeat) return;
@@ -541,8 +639,22 @@ void display_update() {
     // ── Yellow zone (rows 0-15): header ──
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(19, 0);
-    display.print(F("LIFEBREACH HRV"));
+    display.setCursor(0, 0);
+    if (tx_active && test_running) {
+        display.printf("CMD: %s", TEST_SEQUENCE[test_step].label);
+    } else if (tx_active) {
+        // MQTT or other external command active
+        hrv_mode_t cmd_mode;
+        uint8_t cmd_fan;
+        if (hrv_decode_lcd(tx_command_byte, &cmd_mode, &cmd_fan) && cmd_mode != MODE_UNKNOWN) {
+            display.printf("CMD: %s Fan %d", hrv_mode_str(cmd_mode), cmd_fan);
+        } else {
+            display.print(F("CMD: Idle"));
+        }
+    } else {
+        display.setCursor(19, 0);
+        display.print(F("LIFEBREACH HRV"));
+    }
     display.setCursor(0, 8);
     if (wifi_connected) {
         display.print(WiFi.localIP().toString().c_str());
@@ -633,6 +745,7 @@ void display_update() {
     prev_display_state.valid     = hrv_state.valid;
     prev_display_state.bath_timer = hrv_state.bath_timer;
     prev_tx_active = tx_active;
+    prev_test_step = test_step;
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -666,10 +779,22 @@ void setup() {
     // Initialize HRV UART
     hrv_uart_init();
 
+    // Launch HRV task on core 1 at high priority (19 of 24)
+    // This task handles UART RX, frame decode, and precision TX timing
+    xTaskCreatePinnedToCore(
+        hrv_task,       // task function
+        "hrv_task",     // name
+        4096,           // stack size
+        NULL,           // parameter
+        19,             // priority (high — only system tasks above)
+        NULL,           // task handle
+        1               // core 1
+    );
+
     // Initialize button
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    Serial.println(F("LifeBreach HRV — WiFi + MQTT enabled"));
+    Serial.println(F("LifeBreach HRV — WiFi + MQTT enabled (FreeRTOS TX)"));
     Serial.printf("UART%d @ %d baud, RX=GPIO%d (inverted), TX=GPIO%d\n",
                   HRV_UART_NUM, HRV_BAUD, HRV_RX_PIN, HRV_TX_PIN);
 }
@@ -677,9 +802,9 @@ void setup() {
 // ── Main loop ───────────────────────────────────────────────────────────────
 
 void loop() {
-    hrv_uart_poll();
-    hrv_tx_poll();
+    // HRV UART + TX timing handled by hrv_task on core 1
     button_poll();
+    test_poll();
     mqtt_loop();
     if (wifi_connected) ArduinoOTA.handle();
     display_update();
