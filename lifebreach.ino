@@ -2,8 +2,14 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "driver/uart.h"
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include <Preferences.h>
 #include "logo_bitmap.h"
 #include "hrv_protocol.h"
+#include "config.h"
 
 // ── OLED configuration ──────────────────────────────────────────────────────
 
@@ -13,19 +19,49 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
+// ── WiFi / MQTT ─────────────────────────────────────────────────────────────
+
+WiFiClient   espClient;
+PubSubClient mqtt(espClient);
+Preferences  prefs;
+
+static char mqtt_server[40] = "";
+static char mqtt_user[20]   = "";
+static char mqtt_pass[20]   = "";
+static bool wifi_connected  = false;
+static bool mqtt_connected  = false;
+static uint32_t last_mqtt_reconnect_ms = 0;
+static uint32_t last_mqtt_publish_ms   = 0;
+static bool     ha_discovery_sent      = false;
+
 // ── HRV state ───────────────────────────────────────────────────────────────
 
 static QueueHandle_t uart_queue;
 static hrv_state_t   hrv_state = {MODE_UNKNOWN, 0, false, false, 0, 0, 0};
 static hrv_state_t   prev_display_state = {MODE_UNKNOWN, 0, false, false, 0, 0, 0};
+static hrv_state_t   prev_mqtt_state = {MODE_UNKNOWN, 0, false, false, 0, 0, 0};
 
 // Sliding buffer for frame sync
 static uint8_t frame_buf[HRV_FRAME_LEN];
-static uint8_t frame_buf_pos = 0;  // number of bytes collected (0-10)
+static uint8_t frame_buf_pos = 0;
 
 // LCD command byte captured between frames
 static uint8_t last_lcd_byte = 0xFF;
 static bool    lcd_byte_valid = false;
+static bool    capture_next_lcd = false;
+
+// TX command state
+static uint8_t  tx_command_byte = 0xFF;
+static bool     tx_pending = false;
+static uint32_t tx_frame_decoded_us = 0;
+
+#define TX_DELAY_US      860   // ~5.86ms from D7 start (matches real LCD command timing)
+
+// Button state (BOOT button on GPIO0)
+#define BUTTON_PIN       0
+#define DEBOUNCE_MS      300
+static uint32_t last_button_ms = 0;
+static bool     tx_active = false;
 
 // Display timing
 static uint32_t last_display_ms  = 0;
@@ -50,23 +86,17 @@ void hrv_uart_init() {
     uart_set_pin(HRV_UART_NUM, HRV_TX_PIN, HRV_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(HRV_UART_NUM, HRV_BUF_SIZE, 0, 32, &uart_queue, 0);
     uart_set_line_inverse(HRV_UART_NUM, UART_SIGNAL_RXD_INV);
-
-    // Trigger ISR after just 1 byte in FIFO (default 120 is too high for 2000 baud)
     uart_set_rx_full_threshold(HRV_UART_NUM, 1);
-    // Short RX timeout: fire after 2 idle character times (~10ms at 2000 baud)
     uart_set_rx_timeout(HRV_UART_NUM, 2);
 }
 
 // ── Frame decoding ──────────────────────────────────────────────────────────
 
 bool hrv_decode_frame(const uint8_t* buf, hrv_mode_t* mode, uint8_t* fan) {
-    // Validate sync byte and tail
     if (buf[0] != HRV_SYNC_BYTE) return false;
     for (int i = 0; i < 5; i++) {
         if (buf[5 + i] != HRV_TAIL[i]) return false;
     }
-
-    // Lookup (B1, B2, B3)
     uint8_t b1 = buf[1], b2 = buf[2], b3 = buf[3];
     for (int i = 0; i < FRAME_LOOKUP_COUNT; i++) {
         if (FRAME_LOOKUP[i].b1 == b1 &&
@@ -77,7 +107,7 @@ bool hrv_decode_frame(const uint8_t* buf, hrv_mode_t* mode, uint8_t* fan) {
             return true;
         }
     }
-    return false;  // valid frame structure but unknown speed/mode combo
+    return false;
 }
 
 bool hrv_decode_lcd(uint8_t val, hrv_mode_t* mode, uint8_t* fan) {
@@ -94,7 +124,12 @@ bool hrv_decode_lcd(uint8_t val, hrv_mode_t* mode, uint8_t* fan) {
 // ── Frame sync and byte processing ─────────────────────────────────────────
 
 void hrv_process_byte(uint8_t val) {
-    // Shift sliding buffer left, insert new byte
+    if (capture_next_lcd) {
+        last_lcd_byte = val;
+        lcd_byte_valid = true;
+        capture_next_lcd = false;
+    }
+
     if (frame_buf_pos < HRV_FRAME_LEN) {
         frame_buf[frame_buf_pos++] = val;
     } else {
@@ -102,7 +137,6 @@ void hrv_process_byte(uint8_t val) {
         frame_buf[HRV_FRAME_LEN - 1] = val;
     }
 
-    // Need full buffer to attempt decode
     if (frame_buf_pos < HRV_FRAME_LEN) return;
 
     hrv_mode_t mode;
@@ -115,14 +149,12 @@ void hrv_process_byte(uint8_t val) {
         hrv_state.last_frame_ms = millis();
         hrv_state.frame_count++;
 
-        // Debug: print decoded frame
         Serial.printf("#%lu  ", hrv_state.frame_count);
         for (int i = 0; i < HRV_FRAME_LEN; i++) {
             Serial.printf("%02X ", frame_buf[i]);
         }
         Serial.printf(" %s Fan %d", hrv_mode_str(mode), fan);
 
-        // Print LCD byte if captured
         if (lcd_byte_valid) {
             hrv_mode_t lcd_mode;
             uint8_t    lcd_fan;
@@ -137,15 +169,14 @@ void hrv_process_byte(uint8_t val) {
         }
         Serial.println();
 
-        // Reset LCD capture for next cycle
         lcd_byte_valid = false;
+        capture_next_lcd = true;
 
-        // Reset buffer position so next bytes start fresh
+        tx_pending = true;
+        tx_frame_decoded_us = micros();
+
         frame_buf_pos = 0;
     } else {
-        // This byte didn't complete a valid frame — could be LCD command byte
-        last_lcd_byte  = val;
-        lcd_byte_valid = true;
         hrv_state.error_count++;
     }
 }
@@ -153,7 +184,6 @@ void hrv_process_byte(uint8_t val) {
 // ── UART polling ────────────────────────────────────────────────────────────
 
 void hrv_uart_poll() {
-    // Check for UART events (break detection for bathroom timer)
     uart_event_t event;
     while (xQueueReceive(uart_queue, &event, 0) == pdTRUE) {
         if (event.type == UART_BREAK) {
@@ -163,11 +193,314 @@ void hrv_uart_poll() {
         }
     }
 
-    // Read available bytes
     uint8_t rx_buf[32];
     int len = uart_read_bytes(HRV_UART_NUM, rx_buf, sizeof(rx_buf), 0);
     for (int i = 0; i < len; i++) {
         hrv_process_byte(rx_buf[i]);
+    }
+}
+
+// ── Button handling ─────────────────────────────────────────────────────────
+
+void button_poll() {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        uint32_t now = millis();
+        if ((now - last_button_ms) > DEBOUNCE_MS) {
+            // Check for long press (3s) to reset WiFi
+            uint32_t press_start = millis();
+            while (digitalRead(BUTTON_PIN) == LOW) {
+                if (millis() - press_start > 3000) {
+                    Serial.println(F("Long press — resetting WiFi config"));
+                    display.clearDisplay();
+                    display.setTextSize(1);
+                    display.setTextColor(SSD1306_WHITE);
+                    display.setCursor(0, 24);
+                    display.print(F("WiFi reset..."));
+                    display.setCursor(0, 36);
+                    display.print(F("Rebooting"));
+                    display.display();
+                    WiFiManager wm;
+                    wm.resetSettings();
+                    delay(1000);
+                    ESP.restart();
+                }
+            }
+
+            // Short press — toggle TX mode
+            last_button_ms = millis();
+            tx_active = !tx_active;
+            tx_command_byte = tx_active ? 0xCF : 0xFF;
+            Serial.printf("Button: TX %s (0x%02X)\n",
+                          tx_active ? "Recirc Fan 1" : "Idle", tx_command_byte);
+        }
+    }
+}
+
+// ── TX polling ──────────────────────────────────────────────────────────────
+
+void hrv_tx_poll() {
+    if (tx_pending && (micros() - tx_frame_decoded_us >= TX_DELAY_US)) {
+        uart_write_bytes(HRV_UART_NUM, (const char*)&tx_command_byte, 1);
+        tx_pending = false;
+    }
+}
+
+// ── WiFi + MQTT ─────────────────────────────────────────────────────────────
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+    // Parse command: {"mode":"Recirc","fan":1}
+    // Simple parsing without ArduinoJson
+    char buf[128];
+    unsigned int len = min(length, (unsigned int)(sizeof(buf) - 1));
+    memcpy(buf, payload, len);
+    buf[len] = '\0';
+
+    Serial.printf("MQTT cmd: %s\n", buf);
+
+    // Extract mode
+    hrv_mode_t cmd_mode = MODE_UNKNOWN;
+    if (strstr(buf, "\"Fresh\""))       cmd_mode = MODE_FRESH;
+    else if (strstr(buf, "\"Recirc\"")) cmd_mode = MODE_RECIRC;
+    else if (strstr(buf, "\"Off\""))    cmd_mode = MODE_UNKNOWN;
+
+    // Extract fan speed
+    uint8_t cmd_fan = 0;
+    char* fan_ptr = strstr(buf, "\"fan\":");
+    if (fan_ptr) {
+        cmd_fan = atoi(fan_ptr + 6);
+        if (cmd_fan > 5) cmd_fan = 5;
+    }
+
+    // Apply command
+    if (cmd_mode == MODE_UNKNOWN || cmd_fan == 0) {
+        tx_command_byte = 0xFF;
+        tx_active = false;
+    } else {
+        tx_command_byte = hrv_lcd_command_byte(cmd_mode, cmd_fan);
+        tx_active = true;
+    }
+
+    Serial.printf("MQTT -> TX: 0x%02X (%s Fan %d)\n",
+                  tx_command_byte, hrv_mode_str(cmd_mode), cmd_fan);
+}
+
+void mqtt_publish_ha_discovery() {
+    char topic[128];
+    char payload[512];
+
+    // Device JSON fragment (shared by all entities)
+    const char* dev_json =
+        "\"dev\":{\"ids\":[\"" HA_DEVICE_ID "\"],"
+        "\"name\":\"" HA_DEVICE_NAME "\","
+        "\"mf\":\"LifeBreach\","
+        "\"mdl\":\"ESP32 HRV Controller\"}";
+
+    // Sensor: Mode
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_mode/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Mode\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.mode}}\","
+             "\"uniq_id\":\"%s_mode\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Sensor: Fan Speed
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_fan/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Fan Speed\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.fan}}\","
+             "\"uniq_id\":\"%s_fan\","
+             "\"ic\":\"mdi:fan\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Sensor: Uptime
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_uptime/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Uptime\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.uptime}}\","
+             "\"uniq_id\":\"%s_uptime\","
+             "\"unit_of_meas\":\"s\","
+             "\"ic\":\"mdi:timer-outline\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Sensor: WiFi RSSI
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_rssi/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV WiFi Signal\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.rssi}}\","
+             "\"uniq_id\":\"%s_rssi\","
+             "\"unit_of_meas\":\"dBm\","
+             "\"ic\":\"mdi:wifi\","
+             "\"ent_cat\":\"diagnostic\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    Serial.println(F("HA discovery published"));
+}
+
+void mqtt_publish_state() {
+    if (!mqtt.connected()) return;
+
+    char payload[200];
+    snprintf(payload, sizeof(payload),
+             "{\"mode\":\"%s\",\"fan\":%d,\"uptime\":%lu,\"frames\":%lu,\"rssi\":%d}",
+             hrv_mode_str(hrv_state.mode),
+             hrv_state.fan_speed,
+             millis() / 1000,
+             hrv_state.frame_count,
+             WiFi.RSSI());
+    mqtt.publish(MQTT_TOPIC_STATE, payload);
+}
+
+void mqtt_reconnect() {
+    if (!wifi_connected) return;
+    uint32_t now = millis();
+    if ((now - last_mqtt_reconnect_ms) < MQTT_RECONNECT_MS) return;
+    last_mqtt_reconnect_ms = now;
+
+    Serial.print(F("MQTT connecting..."));
+    if (mqtt.connect(OTA_HOSTNAME, mqtt_user, mqtt_pass,
+                     MQTT_TOPIC_AVAILABLE, 0, true, "offline")) {
+        Serial.println(F(" OK"));
+        mqtt.publish(MQTT_TOPIC_AVAILABLE, "online", true);
+        mqtt.subscribe(MQTT_TOPIC_COMMAND);
+        mqtt_connected = true;
+
+        if (!ha_discovery_sent) {
+            mqtt_publish_ha_discovery();
+            ha_discovery_sent = true;
+        }
+
+        // Publish current state immediately
+        mqtt_publish_state();
+    } else {
+        Serial.printf(" failed (rc=%d)\n", mqtt.state());
+        mqtt_connected = false;
+    }
+}
+
+void mqtt_loop() {
+    if (!wifi_connected) return;
+
+    if (!mqtt.connected()) {
+        mqtt_connected = false;
+        mqtt_reconnect();
+        return;
+    }
+
+    mqtt.loop();
+
+    // Publish on state change or heartbeat
+    uint32_t now = millis();
+    bool state_changed = (hrv_state.mode     != prev_mqtt_state.mode) ||
+                         (hrv_state.fan_speed != prev_mqtt_state.fan_speed);
+    bool heartbeat = (now - last_mqtt_publish_ms) >= MQTT_HEARTBEAT_MS;
+
+    if (state_changed || heartbeat) {
+        mqtt_publish_state();
+        last_mqtt_publish_ms = now;
+        prev_mqtt_state.mode      = hrv_state.mode;
+        prev_mqtt_state.fan_speed = hrv_state.fan_speed;
+    }
+}
+
+// ── WiFi setup ──────────────────────────────────────────────────────────────
+
+void wifi_setup() {
+    // Load saved MQTT credentials
+    prefs.begin("lifebreach", true);  // read-only
+    prefs.getString("mqtt_srv", mqtt_server, sizeof(mqtt_server));
+    prefs.getString("mqtt_usr", mqtt_user, sizeof(mqtt_user));
+    prefs.getString("mqtt_pwd", mqtt_pass, sizeof(mqtt_pass));
+    prefs.end();
+
+    // WiFiManager custom parameters
+    WiFiManagerParameter param_mqtt_server("mqtt_server", "MQTT Broker IP", mqtt_server, 40);
+    WiFiManagerParameter param_mqtt_user("mqtt_user", "MQTT Username", mqtt_user, 20);
+    WiFiManagerParameter param_mqtt_pass("mqtt_pass", "MQTT Password", mqtt_pass, 20);
+
+    WiFiManager wm;
+    wm.addParameter(&param_mqtt_server);
+    wm.addParameter(&param_mqtt_user);
+    wm.addParameter(&param_mqtt_pass);
+    wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
+
+    // Show portal status on OLED
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 0);
+    display.print(F("WiFi Setup"));
+    display.setCursor(0, 16);
+    display.print(F("Connect to AP:"));
+    display.setTextSize(2);
+    display.setCursor(0, 28);
+    display.print(F("LifeBreach"));
+    display.setTextSize(1);
+    display.setCursor(0, 48);
+    display.print(F("Then open 192.168.4.1"));
+    display.display();
+
+    bool connected = wm.autoConnect(WIFI_AP_NAME);
+
+    if (connected) {
+        wifi_connected = true;
+        Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+        // Save MQTT params if they changed
+        strncpy(mqtt_server, param_mqtt_server.getValue(), sizeof(mqtt_server));
+        strncpy(mqtt_user, param_mqtt_user.getValue(), sizeof(mqtt_user));
+        strncpy(mqtt_pass, param_mqtt_pass.getValue(), sizeof(mqtt_pass));
+
+        prefs.begin("lifebreach", false);  // read-write
+        prefs.putString("mqtt_srv", mqtt_server);
+        prefs.putString("mqtt_usr", mqtt_user);
+        prefs.putString("mqtt_pwd", mqtt_pass);
+        prefs.end();
+
+        // Configure MQTT
+        if (strlen(mqtt_server) > 0) {
+            mqtt.setServer(mqtt_server, 1883);
+            mqtt.setCallback(mqtt_callback);
+            mqtt.setBufferSize(512);  // for HA discovery payloads
+            Serial.printf("MQTT broker: %s\n", mqtt_server);
+        }
+
+        // OTA setup
+        ArduinoOTA.setHostname(OTA_HOSTNAME);
+        ArduinoOTA.setPassword(OTA_PASSWORD);
+        ArduinoOTA.onStart([]() {
+            display.clearDisplay();
+            display.setTextSize(2);
+            display.setCursor(4, 24);
+            display.print(F("OTA UPDATE"));
+            display.display();
+        });
+        ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+            display.fillRect(14, 48, 100, 8, SSD1306_BLACK);
+            display.drawRect(14, 48, 100, 8, SSD1306_WHITE);
+            int w = (progress * 100) / total;
+            display.fillRect(15, 49, w - 2, 6, SSD1306_WHITE);
+            display.display();
+        });
+        ArduinoOTA.begin();
+    } else {
+        wifi_connected = false;
+        Serial.println(F("WiFi not configured — running standalone"));
     }
 }
 
@@ -192,11 +525,12 @@ void display_update() {
     bool showing_bath_timer = hrv_state.bath_timer &&
                               ((now - bath_timer_start) < BATH_TIMER_DISPLAY_MS);
 
-    // Check if anything changed
+    static bool prev_tx_active = false;
     bool state_changed = (hrv_state.mode      != prev_display_state.mode) ||
                          (hrv_state.fan_speed  != prev_display_state.fan_speed) ||
                          (hrv_state.valid      != prev_display_state.valid) ||
-                         (hrv_state.bath_timer != prev_display_state.bath_timer);
+                         (hrv_state.bath_timer != prev_display_state.bath_timer) ||
+                         (tx_active            != prev_tx_active);
     bool heartbeat = (now - last_display_ms) >= DISPLAY_HEARTBEAT_MS;
 
     if (!state_changed && !heartbeat) return;
@@ -209,20 +543,25 @@ void display_update() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(19, 0);
     display.print(F("LIFEBREACH HRV"));
-    display.setCursor(22, 8);
-    display.print(F("--- MONITOR ---"));
+    display.setCursor(0, 8);
+    if (wifi_connected) {
+        display.print(WiFi.localIP().toString().c_str());
+        if (mqtt_connected) {
+            display.print(F(" MQTT"));
+        }
+    } else {
+        display.print(F("NO WIFI"));
+    }
 
     // ── Blue zone (rows 16-63) ──
 
     if (showing_bath_timer) {
-        // Flash bathroom timer alert
         display.setTextSize(2);
         display.setCursor(16, 24);
         display.print(F("BATHROOM"));
         display.setCursor(28, 42);
         display.print(F("TIMER!"));
     } else if (signal_lost) {
-        // No signal state
         display.setTextSize(2);
         display.setCursor(4, 20);
         display.print(F("WAITING..."));
@@ -230,7 +569,6 @@ void display_update() {
         display.setCursor(16, 40);
         display.print(F("No HRV signal"));
     } else {
-        // Normal state: mode + fan speed
         display.setTextSize(2);
         display.setCursor(4, 16);
         if (hrv_state.mode == MODE_FRESH) {
@@ -249,11 +587,10 @@ void display_update() {
             display.print(hrv_state.fan_speed);
         }
 
-        // Speed bar
         display_draw_speed_bar(hrv_state.fan_speed);
     }
 
-    // ── Status line (row 56) ──
+    // ── Status line (row 57) ──
     display.setTextSize(1);
     display.setCursor(0, 57);
     uint32_t uptime_sec = now / 1000;
@@ -276,26 +613,26 @@ void display_update() {
         display.printf("FRM:%lu", hrv_state.frame_count);
     }
 
-    // Signal quality indicator
     display.setCursor(110, 57);
     if (signal_lost) {
         display.print(F("--"));
+    } else if (tx_active) {
+        display.print(F("TX"));
     } else {
-        display.print(F("OK"));
+        display.print(F("RX"));
     }
 
     display.display();
 
-    // Clear bath timer flag after display period
     if (hrv_state.bath_timer && (now - bath_timer_start) >= BATH_TIMER_DISPLAY_MS) {
         hrv_state.bath_timer = false;
     }
 
-    // Update previous state for change detection
     prev_display_state.mode      = hrv_state.mode;
     prev_display_state.fan_speed = hrv_state.fan_speed;
     prev_display_state.valid     = hrv_state.valid;
     prev_display_state.bath_timer = hrv_state.bath_timer;
+    prev_tx_active = tx_active;
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -323,15 +660,27 @@ void setup() {
     display.display();
     delay(3000);
 
+    // WiFi + MQTT + OTA
+    wifi_setup();
+
     // Initialize HRV UART
     hrv_uart_init();
-    Serial.println(F("LifeBreach HRV Monitor — Phase 1"));
-    Serial.printf("UART%d @ %d baud, RX=GPIO%d (inverted)\n", HRV_UART_NUM, HRV_BAUD, HRV_RX_PIN);
+
+    // Initialize button
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    Serial.println(F("LifeBreach HRV — WiFi + MQTT enabled"));
+    Serial.printf("UART%d @ %d baud, RX=GPIO%d (inverted), TX=GPIO%d\n",
+                  HRV_UART_NUM, HRV_BAUD, HRV_RX_PIN, HRV_TX_PIN);
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
 void loop() {
     hrv_uart_poll();
+    hrv_tx_poll();
+    button_poll();
+    mqtt_loop();
+    if (wifi_connected) ArduinoOTA.handle();
     display_update();
 }

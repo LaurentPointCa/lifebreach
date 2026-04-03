@@ -91,6 +91,16 @@ static const lcd_command_t LCD_COMMANDS[] = {
 };
 #define LCD_COMMANDS_COUNT 11
 
+// ── Helper: reverse lookup LCD command byte from mode + fan speed ────────────
+
+static inline uint8_t hrv_lcd_command_byte(hrv_mode_t mode, uint8_t fan_speed) {
+    for (int i = 0; i < LCD_COMMANDS_COUNT; i++) {
+        if (LCD_COMMANDS[i].mode == mode && LCD_COMMANDS[i].fan_speed == fan_speed)
+            return LCD_COMMANDS[i].byte_val;
+    }
+    return 0xFF;  // idle
+}
+
 // ── Helper: mode to string ──────────────────────────────────────────────────
 
 static inline const char* hrv_mode_str(hrv_mode_t mode) {
