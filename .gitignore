@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Arduino IDE
+build/
+*.elf
+*.bin
+*.map
+
+# IDE metadata
+.theia/
+.vscode/
+
+# Claude Code
+.claude/

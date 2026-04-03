@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 140" width="2160" height="420">
+  <defs>
+    <style>
+      .life-text {
+        font-family: 'Arial Black', 'Helvetica Neue', Arial, sans-serif;
+        font-weight: 900;
+        font-style: italic;
+        font-size: 86px;
+        fill: #58595B;
+      }
+      .breach-text {
+        font-family: 'Arial Black', 'Helvetica Neue', Arial, sans-serif;
+        font-weight: 900;
+        font-style: italic;
+        font-size: 86px;
+        fill: #2D5DA1;
+      }
+    </style>
+  </defs>
+
+  <!-- "LIFE" in dark gray -->
+  <text x="12" y="110" class="life-text">LIFE</text>
+
+  <!-- Decorative diagonal squares between words -->
+  <!-- Blue square (top) -->
+  <rect x="270" y="10" width="22" height="22" rx="3" ry="3" fill="#2D5DA1" transform="rotate(-10, 281, 21)"/>
+  <!-- Red square (middle-right) -->
+  <rect x="290" y="34" width="22" height="22" rx="3" ry="3" fill="#ED1C24" transform="rotate(-10, 301, 45)"/>
+  <!-- Red square (bottom-left) -->
+  <rect x="248" y="86" width="22" height="22" rx="3" ry="3" fill="#ED1C24" transform="rotate(-10, 259, 97)"/>
+
+  <!-- "BREACH" in blue -->
+  <text x="282" y="110" class="breach-text">BREACH</text>
+</svg>
