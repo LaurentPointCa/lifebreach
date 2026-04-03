@@ -48,8 +48,13 @@ void hrv_uart_init() {
     };
     uart_param_config(HRV_UART_NUM, &uart_config);
     uart_set_pin(HRV_UART_NUM, HRV_TX_PIN, HRV_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(HRV_UART_NUM, HRV_BUF_SIZE, 0, 8, &uart_queue, 0);
+    uart_driver_install(HRV_UART_NUM, HRV_BUF_SIZE, 0, 32, &uart_queue, 0);
     uart_set_line_inverse(HRV_UART_NUM, UART_SIGNAL_RXD_INV);
+
+    // Trigger ISR after just 1 byte in FIFO (default 120 is too high for 2000 baud)
+    uart_set_rx_full_threshold(HRV_UART_NUM, 1);
+    // Short RX timeout: fire after 2 idle character times (~10ms at 2000 baud)
+    uart_set_rx_timeout(HRV_UART_NUM, 2);
 }
 
 // ── Frame decoding ──────────────────────────────────────────────────────────
@@ -227,7 +232,7 @@ void display_update() {
     } else {
         // Normal state: mode + fan speed
         display.setTextSize(2);
-        display.setCursor(4, 18);
+        display.setCursor(4, 16);
         if (hrv_state.mode == MODE_FRESH) {
             display.print(F("FRESH AIR"));
         } else if (hrv_state.mode == MODE_RECIRC) {
@@ -236,7 +241,7 @@ void display_update() {
             display.print(F("UNKNOWN"));
         }
 
-        display.setCursor(4, 36);
+        display.setCursor(4, 32);
         if (hrv_state.fan_speed == 0) {
             display.print(F("STANDBY"));
         } else {
@@ -250,19 +255,29 @@ void display_update() {
 
     // ── Status line (row 56) ──
     display.setTextSize(1);
-    display.setCursor(0, 56);
+    display.setCursor(0, 57);
     uint32_t uptime_sec = now / 1000;
     uint32_t up_min = uptime_sec / 60;
-    if (up_min > 0) {
+    uint32_t up_hrs = up_min / 60;
+    uint32_t up_days = up_hrs / 24;
+    if (up_days > 0) {
+        display.printf("UP:%lu.%lud", up_days, (up_hrs % 24) * 10 / 24);
+    } else if (up_min >= 50) {
+        display.printf("UP:%lu.%luh", up_hrs, (up_min % 60) * 10 / 60);
+    } else if (up_min > 0) {
         display.printf("UP:%lum", up_min);
     } else {
         display.printf("UP:%lus", uptime_sec);
     }
-    display.setCursor(50, 56);
-    display.printf("FRM:%lu", hrv_state.frame_count);
+    display.setCursor(50, 57);
+    if (hrv_state.frame_count > 9999) {
+        display.printf("FRM:%lu.%luk", hrv_state.frame_count / 1000, (hrv_state.frame_count % 1000) / 100);
+    } else {
+        display.printf("FRM:%lu", hrv_state.frame_count);
+    }
 
     // Signal quality indicator
-    display.setCursor(110, 56);
+    display.setCursor(110, 57);
     if (signal_lost) {
         display.print(F("--"));
     } else {
