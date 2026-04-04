@@ -21,6 +21,12 @@ static const uint8_t HRV_TAIL[5] = {0x3B, 0x2F, 0xF7, 0xEF, 0xD7};
 #define HRV_TX_PIN      17
 #define HRV_BUF_SIZE    256
 
+// LCD-side UART (relay to wall panel)
+#define LCD_UART_NUM    UART_NUM_1
+#define LCD_TX_PIN      4
+#define LCD_RX_PIN      5
+#define LCD_BUF_SIZE    256
+
 // ── Data types ──────────────────────────────────────────────────────────────
 
 typedef enum {
