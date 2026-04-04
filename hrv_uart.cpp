@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "driver/uart.h"
+#include "soc/uart_reg.h"
 #include "hrv_uart.h"
 #include "hrv_protocol.h"
 
@@ -24,11 +25,21 @@ static uint8_t last_lcd_byte = 0xFF;
 static bool    lcd_byte_valid = false;
 static bool    capture_next_lcd = false;
 
-// LCD relay state — sends one byte every 20ms to match HRV timing
+// LCD relay state — hardware timer ISR sends one byte every 20ms
 static uint8_t  lcd_relay_buf[HRV_FRAME_LEN];
-static uint8_t  lcd_relay_pos = HRV_FRAME_LEN;  // >= FRAME_LEN means idle
-static uint32_t lcd_relay_last_us = 0;
-#define LCD_BYTE_INTERVAL_US  20000  // 20ms start-to-start
+static volatile uint8_t lcd_relay_pos = HRV_FRAME_LEN;
+static volatile bool lcd_relay_start_pending = false;
+static hw_timer_t* lcd_relay_timer = NULL;
+#define LCD_BYTE_INTERVAL_US  20094  // Match HRV's native ~20.094ms byte spacing
+
+// ISR: writes directly to UART1 FIFO register — no driver calls, no locks.
+// When lcd_relay_pos >= HRV_FRAME_LEN, ISR fires but does nothing (harmless).
+void IRAM_ATTR lcd_relay_isr() {
+    if (lcd_relay_pos < HRV_FRAME_LEN) {
+        WRITE_PERI_REG(UART_FIFO_REG(1), lcd_relay_buf[lcd_relay_pos]);
+        lcd_relay_pos++;
+    }
+}
 
 // ── TX delay lookup ────────────────────────────────────────────────────────
 // Timing is part of the protocol — each command has a unique delay.
@@ -78,6 +89,14 @@ void lcd_uart_init() {
     uart_set_pin(LCD_UART_NUM, LCD_TX_PIN, LCD_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(LCD_UART_NUM, LCD_BUF_SIZE, LCD_BUF_SIZE, 0, NULL, 0);
     uart_set_line_inverse(LCD_UART_NUM, UART_SIGNAL_RXD_INV);
+
+    // Hardware timer ISR for precise byte relay to LCD panel.
+    // Runs continuously — ISR checks lcd_relay_pos and does nothing
+    // when there's no frame to relay (pos >= HRV_FRAME_LEN).
+    // 1MHz = 1us/tick, alarm at 20094 ticks = 20.094ms (matches HRV clock).
+    lcd_relay_timer = timerBegin(1000000);
+    timerAttachInterrupt(lcd_relay_timer, &lcd_relay_isr);
+    timerAlarm(lcd_relay_timer, LCD_BYTE_INTERVAL_US, true, 0);
 }
 
 // ── Frame decoding ─────────────────────────────────────────────────────────
@@ -172,11 +191,10 @@ static void hrv_process_byte(uint8_t val) {
         tx_pending = true;
         tx_frame_decoded_us = micros();
 
-        // Start forwarding HRV frame to LCD panel — one byte every 20ms
+        // Queue HRV frame for LCD relay — actual start deferred to hrv_task
+        // AFTER hrv_tx_send completes, to avoid timing interference
         memcpy(lcd_relay_buf, frame_buf, HRV_FRAME_LEN);
-        lcd_relay_pos = 1;
-        lcd_relay_last_us = tx_frame_decoded_us;
-        uart_tx_chars(LCD_UART_NUM, (const char*)&lcd_relay_buf[0], 1);
+        lcd_relay_start_pending = true;
 
         frame_buf_pos = 0;
     } else {
@@ -232,13 +250,11 @@ void hrv_task(void* param) {
             hrv_tx_send();
         }
 
-        // LCD relay: send next byte when 20ms has elapsed
-        if (lcd_relay_pos < HRV_FRAME_LEN) {
-            if ((micros() - lcd_relay_last_us) >= LCD_BYTE_INTERVAL_US) {
-                uart_tx_chars(LCD_UART_NUM, (const char*)&lcd_relay_buf[lcd_relay_pos], 1);
-                lcd_relay_pos++;
-                lcd_relay_last_us += LCD_BYTE_INTERVAL_US;
-            }
+        // LCD relay: let hardware timer ISR send all 10 bytes (B0-B9)
+        // with perfect 20ms spacing. B0 waits for next timer tick.
+        if (lcd_relay_start_pending) {
+            lcd_relay_start_pending = false;
+            lcd_relay_pos = 0;
         }
     }
 }
