@@ -63,7 +63,9 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     memcpy(buf, payload, len);
     buf[len] = '\0';
 
+#if HRV_DEBUG
     Serial.printf("MQTT cmd: %s\n", buf);
+#endif
 
     for (int i = 0; i < MQTT_CMD_OPTIONS_COUNT; i++) {
         if (strcmp(buf, MQTT_CMD_OPTIONS[i].label) == 0) {
@@ -76,14 +78,18 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 tx_active = true;
             }
             current_cmd_label = opt->label;
+#if HRV_DEBUG
             Serial.printf("MQTT -> TX: 0x%02X (%s)\n", tx_command_byte, opt->label);
+#endif
 
             mqtt.publish(MQTT_TOPIC_CMD_STATE, opt->label, true);
             return;
         }
     }
 
+#if HRV_DEBUG
     Serial.printf("MQTT: unknown command '%s'\n", buf);
+#endif
 }
 
 // ── HA auto-discovery ──────────────────────────────────────────────────────
@@ -169,7 +175,9 @@ static void mqtt_publish_ha_discovery() {
     mqtt.publish(topic, payload, true);
 
     mqtt.publish(MQTT_TOPIC_CMD_STATE, current_cmd_label, true);
+#if HRV_DEBUG
     Serial.println(F("HA discovery published"));
+#endif
 }
 
 // ── State publishing ───────────────────────────────────────────────────────
@@ -196,10 +204,14 @@ static void mqtt_reconnect() {
     if ((now - last_mqtt_reconnect_ms) < MQTT_RECONNECT_MS) return;
     last_mqtt_reconnect_ms = now;
 
+#if HRV_DEBUG
     Serial.print(F("MQTT connecting..."));
+#endif
     if (mqtt.connect(OTA_HOSTNAME, mqtt_user, mqtt_pass,
                      MQTT_TOPIC_AVAILABLE, 0, true, "offline")) {
+#if HRV_DEBUG
         Serial.println(F(" OK"));
+#endif
         mqtt.publish(MQTT_TOPIC_AVAILABLE, "online", true);
         mqtt.subscribe(MQTT_TOPIC_COMMAND);
         mqtt_connected = true;
@@ -211,7 +223,9 @@ static void mqtt_reconnect() {
 
         mqtt_publish_state();
     } else {
+#if HRV_DEBUG
         Serial.printf(" failed (rc=%d)\n", mqtt.state());
+#endif
         mqtt_connected = false;
     }
 }
@@ -280,7 +294,9 @@ void wifi_setup(Adafruit_SSD1306& display) {
 
     if (connected) {
         wifi_connected = true;
+#if HRV_DEBUG
         Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+#endif
 
         strncpy(mqtt_server, param_mqtt_server.getValue(), sizeof(mqtt_server));
         strncpy(mqtt_user, param_mqtt_user.getValue(), sizeof(mqtt_user));
@@ -296,7 +312,9 @@ void wifi_setup(Adafruit_SSD1306& display) {
             mqtt.setServer(mqtt_server, 1883);
             mqtt.setCallback(mqtt_callback);
             mqtt.setBufferSize(512);
+#if HRV_DEBUG
             Serial.printf("MQTT broker: %s\n", mqtt_server);
+#endif
         }
 
         ArduinoOTA.setHostname(OTA_HOSTNAME);
@@ -318,6 +336,8 @@ void wifi_setup(Adafruit_SSD1306& display) {
         ArduinoOTA.begin();
     } else {
         wifi_connected = false;
+#if HRV_DEBUG
         Serial.println(F("WiFi not configured — running standalone"));
+#endif
     }
 }

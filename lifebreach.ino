@@ -67,9 +67,11 @@ void test_set_step(uint8_t step) {
     const test_entry_t* e = &TEST_SEQUENCE[step];
     tx_command_byte = hrv_lcd_command_byte(e->mode, e->fan);
     tx_active = (e->mode != MODE_UNKNOWN);
+#if HRV_DEBUG
     Serial.printf("Test [%d/%d]: %s -> TX 0x%02X (delay %uus)\n",
                   step + 1, TEST_SEQUENCE_COUNT, e->label,
                   tx_command_byte, get_tx_delay_us(tx_command_byte));
+#endif
 }
 
 void test_poll() {
@@ -81,7 +83,9 @@ void test_poll() {
             test_running = false;
             tx_command_byte = 0xFF;
             tx_active = false;
+#if HRV_DEBUG
             Serial.println(F("Test sequence complete"));
+#endif
         } else {
             test_step_ms = now;
             test_set_step(test_step);
@@ -97,7 +101,9 @@ void button_poll() {
             uint32_t press_start = millis();
             while (digitalRead(BUTTON_PIN) == LOW) {
                 if (millis() - press_start > 3000) {
+#if HRV_DEBUG
                     Serial.println(F("Long press — resetting WiFi config"));
+#endif
                     display.clearDisplay();
                     display.setTextSize(1);
                     display.setTextColor(SSD1306_WHITE);
@@ -119,7 +125,9 @@ void button_poll() {
                 test_running = false;
                 tx_command_byte = 0xFF;
                 tx_active = false;
+#if HRV_DEBUG
                 Serial.println(F("Test sequence stopped"));
+#endif
             } else {
                 test_running = true;
                 test_step = 0;
@@ -211,21 +219,29 @@ void display_update() {
         display.print(F("No HRV signal"));
     } else {
         display.setTextSize(2);
+
+        // Line 1 (row 16): LCD panel command
         display.setCursor(4, 16);
-        if (hrv_state.mode == MODE_FRESH) {
-            display.print(F("FRESH AIR"));
-        } else if (hrv_state.mode == MODE_RECIRC) {
-            display.print(F("RECIRC"));
+        if (lcd_rx_valid) {
+            hrv_mode_t lcd_mode;
+            uint8_t    lcd_fan;
+            if (hrv_decode_lcd(lcd_rx_last_cmd, &lcd_mode, &lcd_fan) && lcd_mode != MODE_UNKNOWN) {
+                display.printf("%-6s|%2c", hrv_mode_str(lcd_mode),
+                               lcd_fan > 0 ? ('0' + lcd_fan) : '-');
+            } else {
+                display.print(F("IDLE  | -"));
+            }
         } else {
-            display.print(F("UNKNOWN"));
+            display.print(F("LCD  ?"));
         }
 
+        // Line 2 (row 32): HRV status
         display.setCursor(4, 32);
-        if (hrv_state.fan_speed == 0) {
-            display.print(F("STANDBY"));
+        if (hrv_state.mode != MODE_UNKNOWN) {
+            display.printf("%-6s|%2c", hrv_mode_str(hrv_state.mode),
+                           hrv_state.fan_speed > 0 ? ('0' + hrv_state.fan_speed) : '-');
         } else {
-            display.print(F("FAN: "));
-            display.print(hrv_state.fan_speed);
+            display.print(F("  ??  | -"));
         }
 
         display_draw_speed_bar(hrv_state.fan_speed);
@@ -323,11 +339,13 @@ void setup() {
     // Initialize button
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    Serial.println(F("LifeBreach HRV — WiFi + MQTT + LCD relay (FreeRTOS TX)"));
+#if HRV_DEBUG
+    Serial.println(F("LifeBreach HRV — WiFi + MQTT + LCD relay (FreeRTOS TX) [DEBUG]"));
     Serial.printf("HRV UART%d @ %d baud, RX=GPIO%d (inv), TX=GPIO%d\n",
                   HRV_UART_NUM, HRV_BAUD, HRV_RX_PIN, HRV_TX_PIN);
-    Serial.printf("LCD UART%d @ %d baud, TX=GPIO%d, RX=GPIO%d (inv)\n",
+    Serial.printf("LCD UART%d @ %d baud, TX=GPIO%d, RX=GPIO%d\n",
                   LCD_UART_NUM, HRV_BAUD, LCD_TX_PIN, LCD_RX_PIN);
+#endif
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────
@@ -335,6 +353,7 @@ void setup() {
 void loop() {
     button_poll();
     test_poll();
+    lcd_rx_poll();
     mqtt_loop();
     if (wifi_connected) ArduinoOTA.handle();
     display_update();

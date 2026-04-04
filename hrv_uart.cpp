@@ -14,6 +14,9 @@ volatile bool     tx_pending = false;
 volatile uint32_t tx_frame_decoded_us = 0;
 bool              tx_active = false;
 
+uint8_t  lcd_rx_last_cmd = 0xFF;
+bool     lcd_rx_valid = false;
+
 // ── Private state ──────────────────────────────────────────────────────────
 
 static QueueHandle_t uart_queue;
@@ -32,6 +35,9 @@ static volatile bool lcd_relay_start_pending = false;
 static hw_timer_t* lcd_relay_timer = NULL;
 #define LCD_BYTE_INTERVAL_US  20094  // Match HRV's native ~20.094ms byte spacing
 
+// LCD RX state — parse stream to discard HRV frame echoes, capture LCD commands
+static uint8_t lcd_rx_frame_pos = 0;  // 0 = not in frame, 1-9 = discarding frame bytes
+
 // ISR: writes directly to UART1 FIFO register — no driver calls, no locks.
 // When lcd_relay_pos >= HRV_FRAME_LEN, ISR fires but does nothing (harmless).
 void IRAM_ATTR lcd_relay_isr() {
@@ -43,17 +49,30 @@ void IRAM_ATTR lcd_relay_isr() {
 
 // ── TX delay lookup ────────────────────────────────────────────────────────
 // Timing is part of the protocol — each command has a unique delay.
-// Microseconds from frame decode (D7 fully received) to TX byte start.
+// Microseconds from tx_frame_decoded_us capture to TX byte start.
 // Pattern: ~500us (1 bit period) step per speed level.
+//
+// Two calibration sets: HRV_DEBUG=1 captures the timestamp AFTER ~440us of
+// Serial.printf overhead. HRV_DEBUG=0 captures immediately after decode,
+// so all delays are 440us longer to hit the same absolute time from D7.
 
 uint16_t get_tx_delay_us(uint8_t cmd_byte) {
     switch (cmd_byte) {
+#if HRV_DEBUG
         case 0xCF: case 0xDF: return  560;  // Fan 1: 5.86ms from D7 start
         case 0xE7: case 0xEF: return 1060;  // Fan 2: 6.36ms from D7 start
         case 0xF3: case 0xF7: return 1570;  // Fan 3: 6.87ms from D7 start
         case 0xF9: case 0xFB: return 2070;  // Fan 4: 7.37ms from D7 start
         case 0xFC: case 0xFD: return 2580;  // Fan 5: 7.88ms from D7 start
         case 0xFF: default:   return 3590;  // Idle:  8.89ms from D7 start
+#else
+        case 0xCF: case 0xDF: return 1000;  // Fan 1: 5.86ms from D7 start
+        case 0xE7: case 0xEF: return 1500;  // Fan 2: 6.36ms from D7 start
+        case 0xF3: case 0xF7: return 2010;  // Fan 3: 6.87ms from D7 start
+        case 0xF9: case 0xFB: return 2510;  // Fan 4: 7.37ms from D7 start
+        case 0xFC: case 0xFD: return 3020;  // Fan 5: 7.88ms from D7 start
+        case 0xFF: default:   return 4030;  // Idle:  8.89ms from D7 start
+#endif
     }
 }
 
@@ -88,7 +107,8 @@ void lcd_uart_init() {
     uart_param_config(LCD_UART_NUM, &uart_config);
     uart_set_pin(LCD_UART_NUM, LCD_TX_PIN, LCD_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(LCD_UART_NUM, LCD_BUF_SIZE, LCD_BUF_SIZE, 0, NULL, 0);
-    uart_set_line_inverse(LCD_UART_NUM, UART_SIGNAL_RXD_INV);
+    // No RXD inversion — LCD RX uses a voltage divider (no opto to invert)
+    // uart_set_line_inverse(LCD_UART_NUM, UART_SIGNAL_RXD_INV);
 
     // Hardware timer ISR for precise byte relay to LCD panel.
     // Runs continuously — ISR checks lcd_relay_pos and does nothing
@@ -158,11 +178,10 @@ static void hrv_process_byte(uint8_t val) {
         hrv_state.last_frame_ms = millis();
         hrv_state.frame_count++;
 
-        // WARNING: Debug output MUST stay before tx_frame_decoded_us capture.
-        // The TX delay values (560-3590us) were calibrated with ~0.44ms of
-        // Serial.printf overhead between frame decode and timestamp capture.
-        // Moving, adding, or removing prints here shifts ALL command timing.
-        // If you change this block, recalibrate get_tx_delay_us() values.
+#if HRV_DEBUG
+        // Debug output MUST stay before tx_frame_decoded_us capture.
+        // The debug TX delay values (560-3590us) are calibrated with ~0.44ms
+        // of Serial.printf overhead between frame decode and timestamp capture.
         Serial.printf("#%lu  ", hrv_state.frame_count);
         for (int i = 0; i < HRV_FRAME_LEN; i++) {
             Serial.printf("%02X ", frame_buf[i]);
@@ -182,12 +201,12 @@ static void hrv_process_byte(uint8_t val) {
             }
         }
         Serial.println();
+#endif
 
         lcd_byte_valid = false;
         capture_next_lcd = true;
 
-        // TX timestamp — calibrated delay values depend on this being
-        // captured after the Serial.printf block above
+        // TX timestamp — production values account for no debug print overhead
         tx_pending = true;
         tx_frame_decoded_us = micros();
 
@@ -255,6 +274,48 @@ void hrv_task(void* param) {
         if (lcd_relay_start_pending) {
             lcd_relay_start_pending = false;
             lcd_relay_pos = 0;
+            lcd_rx_frame_pos = 0;  // reset frame parse state for new relay
+        }
+    }
+}
+
+// ── LCD RX polling (call from main loop) ──────────────────────────────────
+// Parses the LCD UART RX stream to separate HRV frame echoes from LCD commands.
+// Since TX and RX share the same wire, every byte we relay echoes back.
+// The HRV frame always starts with 0xBF (no LCD command uses that value),
+// so we use it as a sync marker: 0xBF + 9 bytes = frame echo (discard),
+// anything else = LCD panel command byte.
+
+void lcd_rx_poll() {
+    uint8_t buf[32];
+    int len = uart_read_bytes(LCD_UART_NUM, buf, sizeof(buf), 0);
+    for (int i = 0; i < len; i++) {
+        if (lcd_rx_frame_pos > 0) {
+            // Inside a frame echo — discard remaining bytes
+            lcd_rx_frame_pos++;
+            if (lcd_rx_frame_pos >= HRV_FRAME_LEN) {
+                lcd_rx_frame_pos = 0;
+            }
+        } else if (buf[i] == HRV_SYNC_BYTE) {
+            // Start of HRV frame echo — discard this and next 9 bytes
+            lcd_rx_frame_pos = 1;
+        } else {
+            // LCD panel command byte
+            lcd_rx_last_cmd = buf[i];
+            lcd_rx_valid = true;
+#if HRV_DEBUG
+            Serial.printf("LCD RX: 0x%02X", buf[i]);
+            hrv_mode_t lcd_mode;
+            uint8_t    lcd_fan;
+            if (hrv_decode_lcd(buf[i], &lcd_mode, &lcd_fan)) {
+                if (lcd_mode != MODE_UNKNOWN) {
+                    Serial.printf(" (%s Fan %d)", hrv_mode_str(lcd_mode), lcd_fan);
+                } else {
+                    Serial.print(" (idle)");
+                }
+            }
+            Serial.println();
+#endif
         }
     }
 }

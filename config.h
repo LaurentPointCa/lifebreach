@@ -1,6 +1,14 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// ── Debug ──────────────────────────────────────────────────────────────────
+// Set to 1 for verbose Serial output (HRV frames, LCD RX, MQTT, etc.)
+// Set to 0 for production — disables all non-essential Serial prints.
+// NOTE: TX delay values in hrv_uart.cpp depend on this setting.
+//       Debug prints add ~440us before the TX timestamp capture.
+
+#define HRV_DEBUG  0
+
 // ── MQTT topics ─────────────────────────────────────────────────────────────
 
 #define MQTT_TOPIC_STATE       "lifebreach/state"
