@@ -343,41 +343,59 @@ void hrv_task(void* param) {
 
 // ── WiFi + MQTT ─────────────────────────────────────────────────────────────
 
+// Command option strings — must match HA select discovery options exactly
+struct mqtt_cmd_option_t {
+    const char* label;
+    hrv_mode_t  mode;
+    uint8_t     fan;
+};
+
+static const mqtt_cmd_option_t MQTT_CMD_OPTIONS[] = {
+    {"Off",       MODE_UNKNOWN, 0},
+    {"Fresh 1",   MODE_FRESH,   1},
+    {"Fresh 2",   MODE_FRESH,   2},
+    {"Fresh 3",   MODE_FRESH,   3},
+    {"Fresh 4",   MODE_FRESH,   4},
+    {"Fresh 5",   MODE_FRESH,   5},
+    {"Recirc 1",  MODE_RECIRC,  1},
+    {"Recirc 2",  MODE_RECIRC,  2},
+    {"Recirc 3",  MODE_RECIRC,  3},
+    {"Recirc 4",  MODE_RECIRC,  4},
+    {"Recirc 5",  MODE_RECIRC,  5},
+};
+#define MQTT_CMD_OPTIONS_COUNT (sizeof(MQTT_CMD_OPTIONS) / sizeof(MQTT_CMD_OPTIONS[0]))
+
+static const char* current_cmd_label = "Off";
+
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-    // Parse command: {"mode":"Recirc","fan":1}
-    // Simple parsing without ArduinoJson
-    char buf[128];
+    char buf[32];
     unsigned int len = min(length, (unsigned int)(sizeof(buf) - 1));
     memcpy(buf, payload, len);
     buf[len] = '\0';
 
     Serial.printf("MQTT cmd: %s\n", buf);
 
-    // Extract mode
-    hrv_mode_t cmd_mode = MODE_UNKNOWN;
-    if (strstr(buf, "\"Fresh\""))       cmd_mode = MODE_FRESH;
-    else if (strstr(buf, "\"Recirc\"")) cmd_mode = MODE_RECIRC;
-    else if (strstr(buf, "\"Off\""))    cmd_mode = MODE_UNKNOWN;
+    // Match against known options
+    for (int i = 0; i < MQTT_CMD_OPTIONS_COUNT; i++) {
+        if (strcmp(buf, MQTT_CMD_OPTIONS[i].label) == 0) {
+            const mqtt_cmd_option_t* opt = &MQTT_CMD_OPTIONS[i];
+            if (opt->mode == MODE_UNKNOWN || opt->fan == 0) {
+                tx_command_byte = 0xFF;
+                tx_active = false;
+            } else {
+                tx_command_byte = hrv_lcd_command_byte(opt->mode, opt->fan);
+                tx_active = true;
+            }
+            current_cmd_label = opt->label;
+            Serial.printf("MQTT -> TX: 0x%02X (%s)\n", tx_command_byte, opt->label);
 
-    // Extract fan speed
-    uint8_t cmd_fan = 0;
-    char* fan_ptr = strstr(buf, "\"fan\":");
-    if (fan_ptr) {
-        cmd_fan = atoi(fan_ptr + 6);
-        if (cmd_fan > 5) cmd_fan = 5;
+            // Publish command state back so HA select reflects the choice
+            mqtt.publish(MQTT_TOPIC_CMD_STATE, opt->label, true);
+            return;
+        }
     }
 
-    // Apply command
-    if (cmd_mode == MODE_UNKNOWN || cmd_fan == 0) {
-        tx_command_byte = 0xFF;
-        tx_active = false;
-    } else {
-        tx_command_byte = hrv_lcd_command_byte(cmd_mode, cmd_fan);
-        tx_active = true;
-    }
-
-    Serial.printf("MQTT -> TX: 0x%02X (%s Fan %d)\n",
-                  tx_command_byte, hrv_mode_str(cmd_mode), cmd_fan);
+    Serial.printf("MQTT: unknown command '%s'\n", buf);
 }
 
 void mqtt_publish_ha_discovery() {
@@ -444,6 +462,25 @@ void mqtt_publish_ha_discovery() {
              "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
              "%s}", HA_DEVICE_ID, dev_json);
     mqtt.publish(topic, payload, true);
+
+    // Select: HRV Control (the controllable entity)
+    snprintf(topic, sizeof(topic),
+             "%s/select/%s_control/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Control\","
+             "\"cmd_t\":\"" MQTT_TOPIC_COMMAND "\","
+             "\"stat_t\":\"" MQTT_TOPIC_CMD_STATE "\","
+             "\"uniq_id\":\"%s_control\","
+             "\"ic\":\"mdi:hvac\","
+             "\"options\":[\"Off\","
+             "\"Fresh 1\",\"Fresh 2\",\"Fresh 3\",\"Fresh 4\",\"Fresh 5\","
+             "\"Recirc 1\",\"Recirc 2\",\"Recirc 3\",\"Recirc 4\",\"Recirc 5\"],"
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Publish initial command state
+    mqtt.publish(MQTT_TOPIC_CMD_STATE, current_cmd_label, true);
 
     Serial.println(F("HA discovery published"));
 }

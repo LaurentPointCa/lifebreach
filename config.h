@@ -6,6 +6,7 @@
 #define MQTT_TOPIC_STATE       "lifebreach/state"
 #define MQTT_TOPIC_AVAILABLE   "lifebreach/available"
 #define MQTT_TOPIC_COMMAND     "lifebreach/command"
+#define MQTT_TOPIC_CMD_STATE   "lifebreach/command_state"
 
 // ── MQTT timing ─────────────────────────────────────────────────────────────
 
