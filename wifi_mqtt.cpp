@@ -28,6 +28,8 @@ static uint32_t last_mqtt_publish_ms   = 0;
 static bool     ha_discovery_sent      = false;
 
 static hrv_state_t prev_mqtt_state = {MODE_UNKNOWN, 0, false, false, 0, 0, 0};
+static bool     prev_mqtt_lcd_bath_timer = false;
+static uint32_t prev_mqtt_lcd_bath_count = 0;
 
 // ── Command options ────────────────────────────────────────────────────────
 // Must match HA select discovery options exactly
@@ -158,6 +160,35 @@ static void mqtt_publish_ha_discovery() {
              "%s}", HA_DEVICE_ID, dev_json);
     mqtt.publish(topic, payload, true);
 
+    // Binary sensor: LCD-side bathroom timer request (live state)
+    snprintf(topic, sizeof(topic),
+             "%s/binary_sensor/%s_lcd_bath_timer/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Bathroom Timer (LCD)\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{'ON' if value_json.lcd_bath_timer else 'OFF'}}\","
+             "\"uniq_id\":\"%s_lcd_bath_timer\","
+             "\"dev_cla\":\"running\","
+             "\"ic\":\"mdi:shower\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Sensor: LCD-side bathroom timer pulse counter (monotonic, survives reconnects)
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_lcd_bath_timer_count/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Bathroom Timer Pulses (LCD)\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.lcd_bath_timer_count}}\","
+             "\"uniq_id\":\"%s_lcd_bath_timer_count\","
+             "\"stat_cla\":\"total_increasing\","
+             "\"ic\":\"mdi:counter\","
+             "\"ent_cat\":\"diagnostic\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
     // Select: HRV Control
     snprintf(topic, sizeof(topic),
              "%s/select/%s_control/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
@@ -185,14 +216,17 @@ static void mqtt_publish_ha_discovery() {
 static void mqtt_publish_state() {
     if (!mqtt.connected()) return;
 
-    char payload[200];
+    char payload[280];
     snprintf(payload, sizeof(payload),
-             "{\"mode\":\"%s\",\"fan\":%d,\"uptime\":%lu,\"frames\":%lu,\"rssi\":%d}",
+             "{\"mode\":\"%s\",\"fan\":%d,\"uptime\":%lu,\"frames\":%lu,\"rssi\":%d,"
+             "\"lcd_bath_timer\":%s,\"lcd_bath_timer_count\":%lu}",
              hrv_mode_str(hrv_state.mode),
              hrv_state.fan_speed,
              millis() / 1000,
              hrv_state.frame_count,
-             WiFi.RSSI());
+             WiFi.RSSI(),
+             lcd_bath_timer ? "true" : "false",
+             lcd_bath_timer_count);
     mqtt.publish(MQTT_TOPIC_STATE, payload);
 }
 
@@ -244,8 +278,10 @@ void mqtt_loop() {
     mqtt.loop();
 
     uint32_t now = millis();
-    bool state_changed = (hrv_state.mode     != prev_mqtt_state.mode) ||
-                         (hrv_state.fan_speed != prev_mqtt_state.fan_speed);
+    bool state_changed = (hrv_state.mode       != prev_mqtt_state.mode) ||
+                         (hrv_state.fan_speed   != prev_mqtt_state.fan_speed) ||
+                         (lcd_bath_timer        != prev_mqtt_lcd_bath_timer) ||
+                         (lcd_bath_timer_count  != prev_mqtt_lcd_bath_count);
     bool heartbeat = (now - last_mqtt_publish_ms) >= MQTT_HEARTBEAT_MS;
 
     if (state_changed || heartbeat) {
@@ -253,6 +289,8 @@ void mqtt_loop() {
         last_mqtt_publish_ms = now;
         prev_mqtt_state.mode      = hrv_state.mode;
         prev_mqtt_state.fan_speed = hrv_state.fan_speed;
+        prev_mqtt_lcd_bath_timer  = lcd_bath_timer;
+        prev_mqtt_lcd_bath_count  = lcd_bath_timer_count;
     }
 }
 

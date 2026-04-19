@@ -158,13 +158,17 @@ void display_update() {
                        ((now - hrv_state.last_frame_ms) > SIGNAL_LOST_MS);
     bool showing_bath_timer = hrv_state.bath_timer &&
                               ((now - bath_timer_start) < BATH_TIMER_DISPLAY_MS);
+    bool showing_lcd_bath_timer = lcd_bath_timer &&
+                                  ((now - lcd_bath_timer_start) < BATH_TIMER_DISPLAY_MS);
 
     static bool prev_tx_active = false;
     static uint8_t prev_test_step = 0xFF;
+    static bool prev_lcd_bath_timer = false;
     bool state_changed = (hrv_state.mode      != prev_display_state.mode) ||
                          (hrv_state.fan_speed  != prev_display_state.fan_speed) ||
                          (hrv_state.valid      != prev_display_state.valid) ||
                          (hrv_state.bath_timer != prev_display_state.bath_timer) ||
+                         (lcd_bath_timer       != prev_lcd_bath_timer) ||
                          (tx_active            != prev_tx_active) ||
                          (test_step            != prev_test_step);
     bool heartbeat = (now - last_display_ms) >= DISPLAY_HEARTBEAT_MS;
@@ -204,13 +208,7 @@ void display_update() {
 
     // ── Blue zone (rows 16-63) ──
 
-    if (showing_bath_timer) {
-        display.setTextSize(2);
-        display.setCursor(16, 24);
-        display.print(F("BATHROOM"));
-        display.setCursor(28, 42);
-        display.print(F("TIMER!"));
-    } else if (signal_lost) {
+    if (signal_lost) {
         display.setTextSize(2);
         display.setCursor(4, 20);
         display.print(F("WAITING..."));
@@ -220,9 +218,11 @@ void display_update() {
     } else {
         display.setTextSize(2);
 
-        // Line 1 (row 16): LCD panel command
+        // Line 1 (row 16): LCD panel command — overridden by LCD-side bathroom timer
         display.setCursor(4, 16);
-        if (lcd_rx_valid) {
+        if (showing_lcd_bath_timer) {
+            display.print(F("TIMER!"));
+        } else if (lcd_rx_valid) {
             hrv_mode_t lcd_mode;
             uint8_t    lcd_fan;
             if (hrv_decode_lcd(lcd_rx_last_cmd, &lcd_mode, &lcd_fan) && lcd_mode != MODE_UNKNOWN) {
@@ -235,9 +235,11 @@ void display_update() {
             display.print(F("LCD  ?"));
         }
 
-        // Line 2 (row 32): HRV status
+        // Line 2 (row 32): HRV status — overridden by bathroom timer banner
         display.setCursor(4, 32);
-        if (hrv_state.mode != MODE_UNKNOWN) {
+        if (showing_bath_timer) {
+            display.print(F("TIMER!"));
+        } else if (hrv_state.mode != MODE_UNKNOWN) {
             display.printf("%-6s|%2c", hrv_mode_str(hrv_state.mode),
                            hrv_state.fan_speed > 0 ? ('0' + hrv_state.fan_speed) : '-');
         } else {
@@ -284,6 +286,10 @@ void display_update() {
     if (hrv_state.bath_timer && (now - bath_timer_start) >= BATH_TIMER_DISPLAY_MS) {
         hrv_state.bath_timer = false;
     }
+    if (lcd_bath_timer && (now - lcd_bath_timer_start) >= BATH_TIMER_DISPLAY_MS) {
+        lcd_bath_timer = false;
+    }
+    prev_lcd_bath_timer = lcd_bath_timer;
 
     prev_display_state.mode      = hrv_state.mode;
     prev_display_state.fan_speed = hrv_state.fan_speed;

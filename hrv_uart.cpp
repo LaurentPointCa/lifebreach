@@ -3,6 +3,7 @@
 #include "soc/uart_reg.h"
 #include "hrv_uart.h"
 #include "hrv_protocol.h"
+#include "config.h"
 
 // ── Shared state ───────────────────────────────────────────────────────────
 
@@ -16,10 +17,14 @@ bool              tx_active = false;
 
 uint8_t  lcd_rx_last_cmd = 0xFF;
 bool     lcd_rx_valid = false;
+bool     lcd_bath_timer = false;
+uint32_t lcd_bath_timer_start = 0;
+uint32_t lcd_bath_timer_count = 0;
 
 // ── Private state ──────────────────────────────────────────────────────────
 
 static QueueHandle_t uart_queue;
+static QueueHandle_t lcd_uart_queue;
 
 static uint8_t frame_buf[HRV_FRAME_LEN];
 static uint8_t frame_buf_pos = 0;
@@ -106,7 +111,7 @@ void lcd_uart_init() {
     };
     uart_param_config(LCD_UART_NUM, &uart_config);
     uart_set_pin(LCD_UART_NUM, LCD_TX_PIN, LCD_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(LCD_UART_NUM, LCD_BUF_SIZE, LCD_BUF_SIZE, 0, NULL, 0);
+    uart_driver_install(LCD_UART_NUM, LCD_BUF_SIZE, LCD_BUF_SIZE, 32, &lcd_uart_queue, 0);
     // No RXD inversion — LCD RX uses a voltage divider (no opto to invert)
     // uart_set_line_inverse(LCD_UART_NUM, UART_SIGNAL_RXD_INV);
 
@@ -287,6 +292,20 @@ void hrv_task(void* param) {
 // anything else = LCD panel command byte.
 
 void lcd_rx_poll() {
+    // Drain UART events — a 7ms LOW pulse from an attached bathroom timer
+    // arrives as UART_BREAK (longer than one 2000-baud frame).
+    uart_event_t event;
+    while (xQueueReceive(lcd_uart_queue, &event, 0) == pdTRUE) {
+        if (event.type == UART_BREAK) {
+            lcd_bath_timer = true;
+            lcd_bath_timer_start = millis();
+            lcd_bath_timer_count++;
+#if HRV_DEBUG
+            Serial.printf("LCD RX: BREAK (bathroom timer) #%lu\n", lcd_bath_timer_count);
+#endif
+        }
+    }
+
     uint8_t buf[32];
     int len = uart_read_bytes(LCD_UART_NUM, buf, sizeof(buf), 0);
     for (int i = 0; i < len; i++) {

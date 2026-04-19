@@ -17,6 +17,9 @@ extern bool              tx_active;
 // LCD RX state (written by lcd_rx_poll, read by main loop for display)
 extern uint8_t  lcd_rx_last_cmd;
 extern bool     lcd_rx_valid;
+extern bool     lcd_bath_timer;        // true if bathroom timer pulse seen on LCD wire
+extern uint32_t lcd_bath_timer_start;  // millis() of last LCD-side BREAK
+extern uint32_t lcd_bath_timer_count;  // monotonic counter — increments on each BREAK
 
 // ── Public API ─────────────────────────────────────────────────────────────
 

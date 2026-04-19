@@ -32,7 +32,7 @@ LCD bus ──opto 3/4──> ESP32 UART1 (GPIO5 RX  / GPIO4 TX)
 OLED ─────────────────ESP32 I2C   (GPIO21 SDA / GPIO22 SCL)
 ```
 
-Each optocoupler provides full galvanic isolation between the 4.5V bus and the ESP32's 3.3V logic. RX optos include a 1N4007 diode in series to prevent partial conduction at the bus LOW voltage (1.32V).
+Each optocoupler provides full galvanic isolation between the 4.5V bus and the ESP32's 3.3V logic. RX optos include a 1N4148 diode in series to prevent partial conduction at the bus LOW voltage (1.32V).
 
 ## Protocol
 
