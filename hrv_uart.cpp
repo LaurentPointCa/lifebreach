@@ -193,15 +193,33 @@ static void hrv_process_byte(uint8_t val) {
 
         hrv_mode_t mode = MODE_UNKNOWN;
         uint8_t    fan  = 0;
+        bool flagged    = false;
         bool recognized = hrv_lookup_speed(frame_buf[1], frame_buf[2], frame_buf[3],
                                            &mode, &fan);
+        if (!recognized && (frame_buf[2] & 0x01) == 0) {
+            // The HRV sets a status flag by clearing bit0 of B2 (e.g. 0x9E from
+            // 0x9F at Fresh 0, 0x98 from 0x99 at Fresh 5 — both verified on the
+            // bus). Normalize to recover the real mode/fan; report the flag too.
+            recognized = hrv_lookup_speed(frame_buf[1], frame_buf[2] | 0x01,
+                                          frame_buf[3], &mode, &fan);
+            flagged = recognized;
+        }
         if (recognized) {
             hrv_state.mode          = mode;
             hrv_state.fan_speed     = fan;
             hrv_state.valid         = true;
-            hrv_state.special_flag  = false;
-            hrv_state.special_count = 0;
+            hrv_state.special_flag  = flagged;
+            if (flagged) {
+                hrv_state.special_b1 = frame_buf[1];
+                hrv_state.special_b2 = frame_buf[2];
+                hrv_state.special_b3 = frame_buf[3];
+                hrv_state.special_b4 = frame_buf[4];
+                hrv_state.special_count++;
+            } else {
+                hrv_state.special_count = 0;
+            }
         } else {
+            // Valid frame, unrecognized even after normalizing — keep last mode/fan.
             hrv_state.special_flag  = true;
             hrv_state.special_count++;
             hrv_state.special_b1 = frame_buf[1];
@@ -219,7 +237,8 @@ static void hrv_process_byte(uint8_t val) {
             Serial.printf("%02X ", frame_buf[i]);
         }
         if (recognized) {
-            Serial.printf(" %s Fan %d", hrv_mode_str(mode), fan);
+            Serial.printf(" %s Fan %d%s", hrv_mode_str(mode), fan,
+                          flagged ? " [FLAG]" : "");
         } else {
             Serial.print(" UNKNOWN code (relayed)");
         }

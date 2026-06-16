@@ -189,6 +189,35 @@ static void mqtt_publish_ha_discovery() {
              "%s}", HA_DEVICE_ID, dev_json);
     mqtt.publish(topic, payload, true);
 
+    // Binary sensor: Special/unknown HRV status flag (e.g. 0x9E) — graph on/off over time
+    snprintf(topic, sizeof(topic),
+             "%s/binary_sensor/%s_special/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Special Flag\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{'ON' if value_json.special else 'OFF'}}\","
+             "\"uniq_id\":\"%s_special\","
+             "\"dev_cla\":\"problem\","
+             "\"ic\":\"mdi:flag-alert\","
+             "\"ent_cat\":\"diagnostic\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
+    // Sensor: raw bytes of the unrecognized frame (B1B2B3B4) for diagnosis
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/%s_special_code/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"HRV Special Code\","
+             "\"stat_t\":\"" MQTT_TOPIC_STATE "\","
+             "\"val_tpl\":\"{{value_json.special_code}}\","
+             "\"uniq_id\":\"%s_special_code\","
+             "\"ic\":\"mdi:barcode\","
+             "\"ent_cat\":\"diagnostic\","
+             "\"avty_t\":\"" MQTT_TOPIC_AVAILABLE "\","
+             "%s}", HA_DEVICE_ID, dev_json);
+    mqtt.publish(topic, payload, true);
+
     // Select: HRV Control
     snprintf(topic, sizeof(topic),
              "%s/select/%s_control/config", HA_DISCOVERY_PREFIX, HA_DEVICE_ID);
@@ -216,17 +245,30 @@ static void mqtt_publish_ha_discovery() {
 static void mqtt_publish_state() {
     if (!mqtt.connected()) return;
 
-    char payload[280];
+    // Raw B1B2B3B4 of the current unrecognized frame (e.g. AF9E5E4F), or "none".
+    char special_code[12];
+    if (hrv_state.special_flag) {
+        snprintf(special_code, sizeof(special_code), "%02X%02X%02X%02X",
+                 hrv_state.special_b1, hrv_state.special_b2,
+                 hrv_state.special_b3, hrv_state.special_b4);
+    } else {
+        strcpy(special_code, "none");
+    }
+
+    char payload[320];
     snprintf(payload, sizeof(payload),
              "{\"mode\":\"%s\",\"fan\":%d,\"uptime\":%lu,\"frames\":%lu,\"rssi\":%d,"
-             "\"lcd_bath_timer\":%s,\"lcd_bath_timer_count\":%lu}",
+             "\"lcd_bath_timer\":%s,\"lcd_bath_timer_count\":%lu,"
+             "\"special\":%s,\"special_code\":\"%s\"}",
              hrv_mode_str(hrv_state.mode),
              hrv_state.fan_speed,
              millis() / 1000,
              hrv_state.frame_count,
              WiFi.RSSI(),
              lcd_bath_timer ? "true" : "false",
-             lcd_bath_timer_count);
+             lcd_bath_timer_count,
+             hrv_state.special_flag ? "true" : "false",
+             special_code);
     mqtt.publish(MQTT_TOPIC_STATE, payload);
 }
 
@@ -278,19 +320,21 @@ void mqtt_loop() {
     mqtt.loop();
 
     uint32_t now = millis();
-    bool state_changed = (hrv_state.mode       != prev_mqtt_state.mode) ||
-                         (hrv_state.fan_speed   != prev_mqtt_state.fan_speed) ||
-                         (lcd_bath_timer        != prev_mqtt_lcd_bath_timer) ||
-                         (lcd_bath_timer_count  != prev_mqtt_lcd_bath_count);
+    bool state_changed = (hrv_state.mode         != prev_mqtt_state.mode) ||
+                         (hrv_state.fan_speed     != prev_mqtt_state.fan_speed) ||
+                         (hrv_state.special_flag  != prev_mqtt_state.special_flag) ||
+                         (lcd_bath_timer          != prev_mqtt_lcd_bath_timer) ||
+                         (lcd_bath_timer_count    != prev_mqtt_lcd_bath_count);
     bool heartbeat = (now - last_mqtt_publish_ms) >= MQTT_HEARTBEAT_MS;
 
     if (state_changed || heartbeat) {
         mqtt_publish_state();
         last_mqtt_publish_ms = now;
-        prev_mqtt_state.mode      = hrv_state.mode;
-        prev_mqtt_state.fan_speed = hrv_state.fan_speed;
-        prev_mqtt_lcd_bath_timer  = lcd_bath_timer;
-        prev_mqtt_lcd_bath_count  = lcd_bath_timer_count;
+        prev_mqtt_state.mode         = hrv_state.mode;
+        prev_mqtt_state.fan_speed    = hrv_state.fan_speed;
+        prev_mqtt_state.special_flag = hrv_state.special_flag;
+        prev_mqtt_lcd_bath_timer     = lcd_bath_timer;
+        prev_mqtt_lcd_bath_count     = lcd_bath_timer_count;
     }
 }
 

@@ -246,12 +246,9 @@ void display_update() {
         display.setCursor(4, 32);
         if (showing_bath_timer) {
             display.print(F("TIMER!"));
-        } else if (hrv_state.special_flag) {
-            // Mode is still readable from B3; show the unknown speed/status code as hex.
-            const char* m = (hrv_state.special_b3 == HRV_FRESH)  ? "Fresh"  :
-                            (hrv_state.special_b3 == HRV_RECIRC) ? "Recirc" : "?";
-            display.printf("%-6s|%02X", m, hrv_state.special_b2);
         } else if (hrv_state.mode != MODE_UNKNOWN) {
+            // Real mode/fan now decode even under the status flag (B2 bit0 masked);
+            // the "! FLAG ..." header still signals the flag is active.
             display.printf("%-6s|%2c", hrv_mode_str(hrv_state.mode),
                            hrv_state.fan_speed > 0 ? ('0' + hrv_state.fan_speed) : '-');
         } else {
