@@ -43,6 +43,14 @@ typedef struct {
     uint32_t   last_frame_ms;  // millis() of last valid frame
     uint32_t   frame_count;    // total valid frames received
     uint32_t   error_count;    // bytes that didn't form valid frames
+    // Structurally-valid frame (sync+tail OK) whose (B1,B2,B3) isn't in FRAME_LOOKUP
+    // — e.g. the HRV's 0x9E status code. We still relay/respond; these record it.
+    bool       special_flag;   // true while last valid frame was unrecognized
+    uint8_t    special_b1;     // raw B1 (config) of the unrecognized frame
+    uint8_t    special_b2;     // raw B2 (speed/status) — the surprising byte
+    uint8_t    special_b3;     // raw B3 (mode)
+    uint8_t    special_b4;     // raw B4 (counter/status)
+    uint32_t   special_count;  // consecutive unrecognized valid frames
 } hrv_state_t;
 
 // ── Frame lookup table ──────────────────────────────────────────────────────

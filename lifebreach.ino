@@ -164,13 +164,15 @@ void display_update() {
     static bool prev_tx_active = false;
     static uint8_t prev_test_step = 0xFF;
     static bool prev_lcd_bath_timer = false;
-    bool state_changed = (hrv_state.mode      != prev_display_state.mode) ||
-                         (hrv_state.fan_speed  != prev_display_state.fan_speed) ||
-                         (hrv_state.valid      != prev_display_state.valid) ||
-                         (hrv_state.bath_timer != prev_display_state.bath_timer) ||
-                         (lcd_bath_timer       != prev_lcd_bath_timer) ||
-                         (tx_active            != prev_tx_active) ||
-                         (test_step            != prev_test_step);
+    bool state_changed = (hrv_state.mode         != prev_display_state.mode) ||
+                         (hrv_state.fan_speed     != prev_display_state.fan_speed) ||
+                         (hrv_state.valid         != prev_display_state.valid) ||
+                         (hrv_state.bath_timer    != prev_display_state.bath_timer) ||
+                         (hrv_state.special_flag  != prev_display_state.special_flag) ||
+                         (hrv_state.special_b2    != prev_display_state.special_b2) ||
+                         (lcd_bath_timer          != prev_lcd_bath_timer) ||
+                         (tx_active               != prev_tx_active) ||
+                         (test_step               != prev_test_step);
     bool heartbeat = (now - last_display_ms) >= DISPLAY_HEARTBEAT_MS;
 
     if (!state_changed && !heartbeat) return;
@@ -182,7 +184,12 @@ void display_update() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    if (tx_active && test_running) {
+    if (hrv_state.special_flag) {
+        // Unknown HRV status code (e.g. 0x9E) — show raw B1B2B3B4 for diagnosis.
+        display.printf("! FLAG %02X%02X%02X%02X",
+                       hrv_state.special_b1, hrv_state.special_b2,
+                       hrv_state.special_b3, hrv_state.special_b4);
+    } else if (tx_active && test_running) {
         display.printf("CMD: %s", TEST_SEQUENCE[test_step].label);
     } else if (tx_active) {
         hrv_mode_t cmd_mode;
@@ -239,6 +246,11 @@ void display_update() {
         display.setCursor(4, 32);
         if (showing_bath_timer) {
             display.print(F("TIMER!"));
+        } else if (hrv_state.special_flag) {
+            // Mode is still readable from B3; show the unknown speed/status code as hex.
+            const char* m = (hrv_state.special_b3 == HRV_FRESH)  ? "Fresh"  :
+                            (hrv_state.special_b3 == HRV_RECIRC) ? "Recirc" : "?";
+            display.printf("%-6s|%02X", m, hrv_state.special_b2);
         } else if (hrv_state.mode != MODE_UNKNOWN) {
             display.printf("%-6s|%2c", hrv_mode_str(hrv_state.mode),
                            hrv_state.fan_speed > 0 ? ('0' + hrv_state.fan_speed) : '-');
@@ -295,6 +307,8 @@ void display_update() {
     prev_display_state.fan_speed = hrv_state.fan_speed;
     prev_display_state.valid     = hrv_state.valid;
     prev_display_state.bath_timer = hrv_state.bath_timer;
+    prev_display_state.special_flag = hrv_state.special_flag;
+    prev_display_state.special_b2   = hrv_state.special_b2;
     prev_tx_active = tx_active;
     prev_test_step = test_step;
 }

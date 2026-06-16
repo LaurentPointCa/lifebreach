@@ -126,12 +126,22 @@ void lcd_uart_init() {
 
 // ── Frame decoding ─────────────────────────────────────────────────────────
 
-static bool hrv_decode_frame(const uint8_t* buf, hrv_mode_t* mode, uint8_t* fan) {
+// Structural validity: correct sync byte and 5-byte tail. This is what qualifies
+// a frame for passthrough (LCD relay + bus TX response), independent of whether we
+// recognize the speed/mode code.
+static bool hrv_frame_valid(const uint8_t* buf) {
     if (buf[0] != HRV_SYNC_BYTE) return false;
     for (int i = 0; i < 5; i++) {
         if (buf[5 + i] != HRV_TAIL[i]) return false;
     }
-    uint8_t b1 = buf[1], b2 = buf[2], b3 = buf[3];
+    return true;
+}
+
+// Speed/mode lookup: maps (B1,B2,B3) to mode + fan speed. Returns false for codes
+// not in FRAME_LOOKUP (e.g. the HRV's 0x9E status code) — caller must NOT drop such
+// frames, only skip updating mode/fan.
+static bool hrv_lookup_speed(uint8_t b1, uint8_t b2, uint8_t b3,
+                             hrv_mode_t* mode, uint8_t* fan) {
     for (int i = 0; i < FRAME_LOOKUP_COUNT; i++) {
         if (FRAME_LOOKUP[i].b1 == b1 &&
             FRAME_LOOKUP[i].b2 == b2 &&
@@ -173,15 +183,32 @@ static void hrv_process_byte(uint8_t val) {
 
     if (frame_buf_pos < HRV_FRAME_LEN) return;
 
-    hrv_mode_t mode;
-    uint8_t    fan;
-
-    if (hrv_decode_frame(frame_buf, &mode, &fan)) {
-        hrv_state.mode          = mode;
-        hrv_state.fan_speed     = fan;
-        hrv_state.valid         = true;
+    // Passthrough (LCD relay + bus TX response) runs for ANY structurally-valid
+    // frame — NOT gated on recognizing the speed/mode code. An unrecognized but
+    // valid frame (e.g. the HRV's 0x9E status code) must keep the bridge alive;
+    // gating relay/TX on the lookup is what caused the 2026-06-15 silent hang.
+    if (hrv_frame_valid(frame_buf)) {
         hrv_state.last_frame_ms = millis();
         hrv_state.frame_count++;
+
+        hrv_mode_t mode = MODE_UNKNOWN;
+        uint8_t    fan  = 0;
+        bool recognized = hrv_lookup_speed(frame_buf[1], frame_buf[2], frame_buf[3],
+                                           &mode, &fan);
+        if (recognized) {
+            hrv_state.mode          = mode;
+            hrv_state.fan_speed     = fan;
+            hrv_state.valid         = true;
+            hrv_state.special_flag  = false;
+            hrv_state.special_count = 0;
+        } else {
+            hrv_state.special_flag  = true;
+            hrv_state.special_count++;
+            hrv_state.special_b1 = frame_buf[1];
+            hrv_state.special_b2 = frame_buf[2];
+            hrv_state.special_b3 = frame_buf[3];
+            hrv_state.special_b4 = frame_buf[4];
+        }
 
 #if HRV_DEBUG
         // Debug output MUST stay before tx_frame_decoded_us capture.
@@ -191,7 +218,11 @@ static void hrv_process_byte(uint8_t val) {
         for (int i = 0; i < HRV_FRAME_LEN; i++) {
             Serial.printf("%02X ", frame_buf[i]);
         }
-        Serial.printf(" %s Fan %d", hrv_mode_str(mode), fan);
+        if (recognized) {
+            Serial.printf(" %s Fan %d", hrv_mode_str(mode), fan);
+        } else {
+            Serial.print(" UNKNOWN code (relayed)");
+        }
 
         if (lcd_byte_valid) {
             hrv_mode_t lcd_mode;
